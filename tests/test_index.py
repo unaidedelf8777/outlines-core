@@ -19,24 +19,22 @@ def index() -> Index:
 
 def test_basic_interface(index):
     init_state = index.get_initial_state()
-    assert init_state == 12
     assert index.is_final_state(init_state) is False
 
     allowed_tokens = index.get_allowed_tokens(init_state)
     assert allowed_tokens == [1, 2]
 
     next_state = index.get_next_state(init_state, allowed_tokens[-1])
-    assert next_state == 20
     assert index.is_final_state(next_state) is True
-    assert index.get_final_states() == {20}
+    assert index.get_final_states() == {next_state}
 
     expected_transitions = {
-        12: {
-            1: 20,
-            2: 20,
+        init_state: {
+            1: next_state,
+            2: next_state,
         },
-        20: {
-            3: 20,
+        next_state: {
+            3: next_state,
         },
     }
     assert index.get_transitions() == expected_transitions

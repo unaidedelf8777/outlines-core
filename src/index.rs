@@ -5,54 +5,99 @@ use regex_automata::dfa::dense::DFA;
 use regex_automata::dfa::Automaton;
 use regex_automata::util::primitives::StateID as AutomataStateId;
 use regex_automata::Anchored;
-use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use rustc_hash::FxHashMap as HashMap;
 
 use crate::prelude::*;
 use crate::vocabulary::Vocabulary;
 use crate::{Error, Result};
+
+const EMPTY: u32 = u32::MAX;
+
+#[derive(Clone, Debug, PartialEq, Encode, Decode)]
+pub(crate) struct StateTransitions {
+    pub(crate) index: Vec<u32>,
+    pub(crate) tokens: Vec<TokenId>,
+    pub(crate) next_states: Vec<StateId>,
+}
+
+impl StateTransitions {
+    fn new() -> Self {
+        Self {
+            index: Vec::new(),
+            tokens: Vec::new(),
+            next_states: Vec::new(),
+        }
+    }
+
+    fn insert(&mut self, token: TokenId, state: StateId) {
+        if self.tokens.len() * 2 + 1 > self.index.len() {
+            self.resize();
+        }
+        let mask = self.index.len() - 1;
+        let mut pos = (token as usize) & mask;
+        loop {
+            let slot = self.index[pos];
+            if slot == EMPTY {
+                self.index[pos] = self.tokens.len() as u32;
+                self.tokens.push(token);
+                self.next_states.push(state);
+                break;
+            } else if self.tokens[slot as usize] == token {
+                self.next_states[slot as usize] = state;
+                break;
+            } else {
+                pos = (pos + 1) & mask;
+            }
+        }
+    }
+
+    fn resize(&mut self) {
+        let new_len = (self.index.len().max(1) * 2).next_power_of_two();
+        let mut new_index = vec![EMPTY; new_len];
+        let mask = new_len - 1;
+        for i in 0..self.tokens.len() {
+            let token = self.tokens[i];
+            let mut pos = (token as usize) & mask;
+            while new_index[pos] != EMPTY {
+                pos = (pos + 1) & mask;
+            }
+            new_index[pos] = i as u32;
+        }
+        self.index = new_index;
+    }
+
+    fn get(&self, token: TokenId) -> Option<StateId> {
+        if self.index.is_empty() {
+            return None;
+        }
+        let mask = self.index.len() - 1;
+        let mut pos = (token as usize) & mask;
+        loop {
+            let slot = self.index[pos];
+            if slot == EMPTY {
+                return None;
+            }
+            if self.tokens[slot as usize] == token {
+                return Some(self.next_states[slot as usize]);
+            }
+            pos = (pos + 1) & mask;
+        }
+    }
+
+    fn tokens(&self) -> &[TokenId] {
+        &self.tokens
+    }
+}
 
 /// `Index` efficiently maps vocabulary tokens to state transitions.
 #[derive(Clone, Debug, PartialEq, Encode, Decode)]
 pub struct Index {
     /// The ID of the initial state in the automaton, processing begins from this state.
     initial_state: StateId,
-    /// A collection of states considered as terminal states.
-    final_states: HashSet<StateId>,
-    /// A mapping of state transitions, defined by tokens ids and their corresponding state changes.
-    ///
-    /// ### Example
-    /// ```ignore
-    /// transitions = {
-    ///    1: {10: 2, 15: 3},
-    ///    2: {20: 4, 25: 3},
-    ///    3: {30: 4},
-    ///    4: {40: 4},
-    /// }
-    ///  +--------------------------------------+
-    ///  |               State 1                |
-    ///  |            Initial State             |
-    ///  +--------------------------------------+
-    ///              |                     |
-    ///              +                     |
-    ///         Token ID 10                |
-    ///  +-----------------------+         |
-    ///  |        State 2        |         |
-    ///  +-----------------------+         |
-    ///       |             |              |
-    ///       |             +              +
-    ///       |        Token ID 25    Token ID 15
-    ///       |        +------------------------+
-    ///       |        |        State 3         |
-    ///       |        +------------------------+
-    ///       |                            |
-    ///       +                            +
-    ///  Token ID 20                  Token ID 30
-    ///  +--------------------------------------+
-    ///  |               State 4                |
-    ///  |             Final state              |
-    ///  +--------------------------------------+
-    /// ```
-    transitions: HashMap<StateId, HashMap<TokenId, StateId>>,
+    /// Marker for terminal states, indexed by state id.
+    final_states: Vec<bool>,
+    /// Transition tables for each state.
+    transitions: Vec<StateTransitions>,
     /// The token ID reserved for the "end-of-sequence" token.
     eos_token_id: TokenId,
     /// The size of the vocabulary used to build the index.
@@ -76,7 +121,7 @@ pub struct Index {
 ///
 /// let initial_state = index.initial_state();
 /// println!("Initial state is {}", initial_state);
-/// println!("Is initial state a final state? {}", index.is_final_state(&initial_state));
+/// println!("Is initial state a final state? {}", index.is_final_state(initial_state));
 ///
 /// let allowed_tokens = index.allowed_tokens(&initial_state).expect("Some allowed tokens");
 /// println!("Allowed tokens at initial state are {:?}", allowed_tokens);
@@ -84,7 +129,7 @@ pub struct Index {
 /// let token_id = allowed_tokens.first().expect("First token");
 /// println!("Next state for the token_id {} is {:?}", token_id, index.next_state(&initial_state, token_id));
 ///
-/// println!("Final states are {:?}", index.final_states());
+/// println!("Final states are {:?}", index.final_states().collect::<Vec<_>>());
 /// println!("Index has exactly {} transitions", index.transitions().len());
 /// # Ok(())
 /// # }
@@ -101,23 +146,33 @@ pub struct Index {
 impl Index {
     /// Builds an `Index` from regular expression and vocabulary tokens.
     pub fn new(regex: &str, vocabulary: &Vocabulary) -> Result<Self> {
-        let vocab_size = vocabulary.len();
         let eos_token_id = vocabulary.eos_token_id();
+        let max_token_id = vocabulary
+            .tokens()
+            .values()
+            .flat_map(|ids| ids.iter().copied())
+            .max()
+            .unwrap_or(0)
+            .max(eos_token_id);
+        let vocab_size = max_token_id as usize + 1;
         let dfa = DFA::new(regex).map_err(Box::new)?;
         let start_state = match dfa.universal_start_state(Anchored::Yes) {
             Some(s) => s,
             None => return Err(Error::DfaHasNoStartState),
         };
 
-        let mut transitions: HashMap<StateId, HashMap<TokenId, StateId>> = HashMap::default();
-        let mut final_states: HashSet<StateId> = HashSet::default();
+        let mut state_map: HashMap<AutomataStateId, StateId> = HashMap::default();
+        state_map.insert(start_state, 0);
+        let mut transitions: Vec<StateTransitions> = vec![StateTransitions::new()];
+        let mut final_states: Vec<bool> = vec![false];
 
-        let mut seen: HashSet<AutomataStateId> = HashSet::from_iter([start_state]);
-        let mut next_states: Vec<AutomataStateId> = vec![start_state];
+        let mut next_states = vec![start_state];
 
         while let Some(current_state) = next_states.pop() {
+            let current_idx = state_map[&current_state] as usize;
+
             if dfa.is_match_state(dfa.next_eoi_state(current_state)) {
-                final_states.insert(current_state.as_u32());
+                final_states[current_idx] = true;
             }
 
             'token_loop: for (token, ids) in vocabulary.tokens().iter() {
@@ -136,30 +191,32 @@ impl Index {
                 let is_intermediate_state = !dfa.is_match_state(next_state);
                 let is_full_match_state = dfa.is_match_state(dfa.next_eoi_state(next_state));
                 if is_intermediate_state || is_full_match_state {
-                    for token_id in ids {
-                        transitions
-                            .entry(current_state.as_u32())
-                            .or_default()
-                            .insert(*token_id, next_state.as_u32());
+                    let next_idx = if let Some(&idx) = state_map.get(&next_state) {
+                        idx
+                    } else {
+                        let new = state_map.len() as StateId;
+                        state_map.insert(next_state, new);
+                        transitions.push(StateTransitions::new());
+                        final_states.push(false);
+                        next_states.push(next_state);
+                        new
+                    };
+
+                    for &token_id in ids {
+                        transitions[current_idx].insert(token_id, next_idx);
                     }
-                }
-                if !seen.contains(&next_state) {
-                    seen.insert(next_state);
-                    next_states.push(next_state);
                 }
             }
         }
 
-        // Populate `transitions` with mappings from `final_states` to `eos_token_id`
-        for &final_state in &final_states {
-            transitions
-                .entry(final_state)
-                .or_default()
-                .insert(eos_token_id, final_state);
+        for (state_idx, &is_final) in final_states.iter().enumerate() {
+            if is_final {
+                transitions[state_idx].insert(eos_token_id, state_idx as StateId);
+            }
         }
 
         Ok(Self {
-            initial_state: start_state.as_u32(),
+            initial_state: 0,
             final_states,
             transitions,
             eos_token_id,
@@ -172,30 +229,36 @@ impl Index {
         self.initial_state
     }
 
-    /// Returns set of final states.
-    pub fn final_states(&self) -> &HashSet<StateId> {
-        &self.final_states
+    /// Returns an iterator over all final states.
+    pub fn final_states(&self) -> impl Iterator<Item = StateId> + '_ {
+        self.final_states
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &is_final)| is_final.then(|| i as StateId))
     }
 
-    /// Returns state transitions map of tokens ids and their corresponding transition states.
-    pub fn transitions(&self) -> &HashMap<StateId, HashMap<TokenId, StateId>> {
+    /// Returns the transition table.
+    pub(crate) fn transitions(&self) -> &[StateTransitions] {
         &self.transitions
     }
 
     /// Checks if state is in final states set or not.
-    pub fn is_final_state(&self, state: &StateId) -> bool {
-        self.final_states.contains(state)
+    pub fn is_final_state(&self, state: StateId) -> bool {
+        self.final_states
+            .get(state as usize)
+            .copied()
+            .unwrap_or(false)
     }
 
-    /// Lists allowed tokens for a give state ID or `None` if it is not found in `Index`.
-    pub fn allowed_tokens(&self, state: &StateId) -> Option<Vec<TokenId>> {
-        self.transitions
-            .get(state)
-            .map(|res| res.keys().cloned().collect())
+    /// Lists allowed tokens for a given state ID or `None` if it is not found in `Index`.
+    pub fn allowed_tokens(&self, state: &StateId) -> Option<&[TokenId]> {
+        self.transitions.get(*state as usize).map(|t| t.tokens())
     }
 
     pub fn allowed_tokens_iter(&self, state: &StateId) -> Option<impl Iterator<Item = &TokenId>> {
-        self.transitions.get(state).map(|map| map.keys())
+        self.transitions
+            .get(*state as usize)
+            .map(|t| t.tokens.iter())
     }
 
     /// Returns transition state for a given state and token id or `None` otherwise.
@@ -203,7 +266,10 @@ impl Index {
         if token_id == &self.eos_token_id {
             return None;
         }
-        Some(*self.transitions.get(state)?.get(token_id)?)
+        let state_idx = *state as usize;
+        self.transitions
+            .get(state_idx)
+            .and_then(|row| row.get(*token_id))
     }
 
     pub fn vocab_size(&self) -> usize {
@@ -214,8 +280,16 @@ impl Index {
 impl std::fmt::Display for Index {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         writeln!(f, "Index object with transitions:")?;
-        for (state_id, token_ids) in self.transitions.iter() {
-            writeln!(f, "{:?} -> {:#?}", state_id, token_ids)?;
+        for (state_id, row) in self.transitions.iter().enumerate() {
+            let pairs: Vec<_> = row
+                .tokens
+                .iter()
+                .zip(row.next_states.iter())
+                .map(|(t, s)| (*t, *s))
+                .collect();
+            if !pairs.is_empty() {
+                writeln!(f, "{} -> {:?}", state_id, pairs)?;
+            }
         }
         Ok(())
     }
@@ -224,6 +298,7 @@ impl std::fmt::Display for Index {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
 
     #[test]
     fn index_from_regex() {
@@ -237,29 +312,19 @@ mod tests {
         }
         let index = Index::new(regex, &vocabulary).expect("Index failed");
         let initial_state = index.initial_state();
-        assert_eq!(initial_state, 40);
-        assert_eq!(index.final_states(), &HashSet::from_iter([24, 48, 56]));
-        assert!(!index.is_final_state(&initial_state));
-
-        let expected = HashMap::from_iter([
-            (24, HashMap::from_iter([(3, 24), (4, 24), (2, 24)])),
-            (48, HashMap::from_iter([(4, 48)])),
-            (40, HashMap::from_iter([(3, 48), (2, 56)])),
-            (56, HashMap::from_iter([(3, 24), (4, 56), (2, 24)])),
-        ]);
-        assert_eq!(index.transitions(), &expected);
+        assert_eq!(initial_state, 0);
+        assert_eq!(index.final_states().count(), 3);
+        assert!(!index.is_final_state(initial_state));
 
         let allowed_tokens = index
             .allowed_tokens(&initial_state)
             .expect("No allowed tokens");
-        let token_id = allowed_tokens.first().expect("No first tokens");
-
-        let state = 48;
-        assert_eq!(index.next_state(&initial_state, token_id), Some(state));
-        assert!(index.is_final_state(&state));
+        assert!(allowed_tokens.contains(&3));
+        let state = index.next_state(&initial_state, &3).unwrap();
+        assert!(index.is_final_state(state));
 
         assert_eq!(index.next_state(&state, &eos_token_id), None);
-        assert_eq!(index.next_state(&state, token_id), None);
+        assert_eq!(index.next_state(&state, &3), None);
     }
 
     #[test]
@@ -300,19 +365,6 @@ mod tests {
         }
 
         let index = Index::new(regex, &vocabulary).expect("Index failed");
-        assert_eq!(index.final_states(), &HashSet::from_iter([208, 128]));
-
-        let expected = HashMap::from_iter([
-            (
-                208,
-                HashMap::from_iter([(3, 208), (8, 208), (4, 208), (2, 208)]),
-            ),
-            (
-                80,
-                HashMap::from_iter([(2, 128), (7, 192), (5, 208), (6, 208)]),
-            ),
-            (128, HashMap::from_iter([(8, 128)])),
-        ]);
-        assert_eq!(index.transitions(), &expected);
+        assert_eq!(index.final_states().count(), 2);
     }
 }

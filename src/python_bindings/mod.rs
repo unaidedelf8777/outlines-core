@@ -27,6 +27,40 @@ macro_rules! type_name {
 pub struct PyGuide {
     state: StateId,
     index: PyIndex,
+    mask: Option<Vec<u32>>,
+}
+
+impl PyGuide {
+    #[inline]
+    fn expected_elements(&self) -> usize {
+        (self.index.0.vocab_size() + 31) / 32
+    }
+
+    #[inline]
+    fn ensure_mask_alloc(&mut self) {
+        if self.mask.as_ref().map_or(true, |m| m.len() != self.expected_elements()) {
+            self.mask = Some(vec![0u32; self.expected_elements()]);
+        }
+    }
+
+    #[inline]
+    fn fill_mask_for_state(index: &PyIndex, state: StateId, dst: &mut [u32]) {
+        // zero out destination
+        let len = dst.len();
+        unsafe {
+            std::ptr::write_bytes(dst.as_mut_ptr() as *mut u8, 0, len * 4);
+        }
+        if let Some(tokens) = index.0.allowed_tokens_iter(&state) {
+            for &token in tokens {
+                let t = token as usize;
+                let bucket = t / 32;
+                if bucket < len {
+                    let bit = t % 32;
+                    dst[bucket] |= 1u32 << bit;
+                }
+            }
+        }
+    }
 }
 
 #[pymethods]
@@ -37,6 +71,7 @@ impl PyGuide {
         PyGuide {
             state: index.get_initial_state(),
             index,
+            mask: None,
         }
     }
 
@@ -58,15 +93,20 @@ impl PyGuide {
     }
 
     /// Guide moves to the next state provided by the token id and returns a list of allowed tokens, unless return_tokens is False.
-    #[pyo3(signature = (token_id, return_tokens=None))]
+    #[pyo3(signature = (token_id, return_tokens=None, prefill_mask=None))]
     fn advance(
         &mut self,
         token_id: TokenId,
         return_tokens: Option<bool>,
+        prefill_mask: Option<bool>,
     ) -> PyResult<Option<Vec<TokenId>>> {
         match self.index.get_next_state(self.state, token_id) {
             Some(new_state) => {
                 self.state = new_state;
+                if prefill_mask.unwrap_or(false) {
+                    self.ensure_mask_alloc();
+                    PyGuide::fill_mask_for_state(&self.index, self.state, self.mask.as_mut().unwrap());
+                }
                 if return_tokens.unwrap_or(true) {
                     self.get_tokens().map(Some)
                 } else {
@@ -120,6 +160,20 @@ impl PyGuide {
                     expected_elements * 4
                 )
             ));
+        }
+        if let Some(ref mask) = self.mask {
+            // This should never happen, but just in case.
+            if mask.len() != expected_elements {
+                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                    "Cached mask size ({}) does not match expected elements ({}).",
+                    mask.len(),
+                    expected_elements
+                )));
+            }
+            unsafe {
+                std::ptr::copy_nonoverlapping(mask.as_ptr(), data_ptr as *mut u32, expected_elements);
+            }
+            return Ok(());
         }
         unsafe {
             std::ptr::write_bytes(data_ptr as *mut u8, 0, numel * 4);
@@ -201,7 +255,7 @@ impl PyIndex {
 
     /// Returns allowed tokens in this state.
     fn get_allowed_tokens(&self, state: StateId) -> Option<Vec<TokenId>> {
-        self.0.allowed_tokens(&state)
+        self.0.allowed_tokens(&state).map(|v| v.to_vec())
     }
 
     /// Updates the state.
@@ -211,17 +265,29 @@ impl PyIndex {
 
     /// Determines whether the current state is a final state.
     fn is_final_state(&self, state: StateId) -> bool {
-        self.0.is_final_state(&state)
+        self.0.is_final_state(state)
     }
 
     /// Get all final states.
     fn get_final_states(&self) -> HashSet<StateId> {
-        self.0.final_states().clone()
+        self.0.final_states().collect()
     }
 
     /// Returns the Index as a Python Dict object.
     fn get_transitions(&self) -> HashMap<StateId, HashMap<TokenId, StateId>> {
-        self.0.transitions().clone()
+        let mut map = HashMap::default();
+        for (state_id, row) in self.0.transitions().iter().enumerate() {
+            if !row.tokens.is_empty() {
+                let inner = row
+                    .tokens
+                    .iter()
+                    .zip(row.next_states.iter())
+                    .map(|(&t, &s)| (t, s))
+                    .collect();
+                map.insert(state_id as StateId, inner);
+            }
+        }
+        map
     }
 
     /// Returns the ID of the initial state of the index.

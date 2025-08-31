@@ -27,12 +27,13 @@ def test_interface():
     index = Index(regex, vocabulary)
     guide = Guide(index)
 
-    assert guide.get_state() == index.get_initial_state() == 12
+    init_state = index.get_initial_state()
+    assert guide.get_state() == init_state
     assert guide.get_tokens() == [1]
 
     assert guide.advance(1) == [vocabulary.get_eos_token_id()]
     assert guide.is_finished()
-    assert guide.get_state() == 20
+    assert guide.get_state() == index.get_next_state(init_state, 1)
     assert guide.get_tokens() == [eos_token_id]
 
     with pytest.raises(

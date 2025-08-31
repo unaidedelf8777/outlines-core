@@ -54,7 +54,7 @@ let initial_state = index.initial_state();
 let allowed_tokens = index.allowed_tokens(&initial_state).expect("Some allowed token ids");
 let token_id = allowed_tokens.first().expect("First token id");
 let next_state = index.next_state(&initial_state, token_id);
-let final_states = index.final_states();
+let final_states: Vec<_> = index.final_states().collect();
 ```
 
 ## Python Bindings

@@ -67,14 +67,14 @@
 //! let index = Index::new(&regex, &vocabulary)?;
 //!
 //! let initial_state = index.initial_state();
-//! println!("Is initial state {} a final state? {}", initial_state, index.is_final_state(&initial_state));
+//! println!("Is initial state {} a final state? {}", initial_state, index.is_final_state(initial_state));
 //!
 //! let allowed_tokens = index.allowed_tokens(&initial_state).expect("Some allowed tokens");
 //! println!("Allowed tokens at initial state are {:?}", allowed_tokens);
 //!
 //! let token_id = allowed_tokens.first().expect("First token");
 //! println!("Next state for the token_id {} is {:?}", token_id, index.next_state(&initial_state, token_id));
-//! println!("Final states are {:?}", index.final_states());
+//! println!("Final states are {:?}", index.final_states().collect::<Vec<_>>());
 //! println!("Index has exactly {} transitions", index.transitions().len());
 //! # Ok(())
 //! }
