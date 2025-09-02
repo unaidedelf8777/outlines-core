@@ -9,6 +9,7 @@ use rustc_hash::FxHashMap as HashMap;
 
 use crate::prelude::*;
 use crate::vocabulary::Vocabulary;
+use crate::vocabulary::trie::TrieNode;
 use crate::{Error, Result};
 
 const EMPTY: u32 = u32::MAX;
@@ -89,6 +90,16 @@ impl StateTransitions {
     }
 }
 
+#[inline(never)]
+pub fn is_match_state<T>(dfa: &DFA<T>, state: AutomataStateId) -> bool  where T: AsRef<[u32]> {
+    dfa.is_match_state(state) && !dfa.is_match_state(dfa.next_eoi_state(state))
+}
+
+#[inline(never)]
+pub fn next_state<T>(dfa: &DFA<T>, state: AutomataStateId, b: u8) -> AutomataStateId where T: AsRef<[u32]> {
+    dfa.next_state(state, b)
+}
+
 /// `Index` efficiently maps vocabulary tokens to state transitions.
 #[derive(Clone, Debug, PartialEq, Encode, Decode)]
 pub struct Index {
@@ -148,10 +159,7 @@ impl Index {
     pub fn new(regex: &str, vocabulary: &Vocabulary) -> Result<Self> {
         let eos_token_id = vocabulary.eos_token_id();
         let max_token_id = vocabulary
-            .tokens()
-            .values()
-            .flat_map(|ids| ids.iter().copied())
-            .max()
+            .max_token_id()
             .unwrap_or(0)
             .max(eos_token_id);
         let vocab_size = max_token_id as usize + 1;
@@ -161,62 +169,76 @@ impl Index {
             None => return Err(Error::DfaHasNoStartState),
         };
 
-        let mut state_map: HashMap<AutomataStateId, StateId> = HashMap::default();
-        state_map.insert(start_state, 0);
         let mut transitions: Vec<StateTransitions> = vec![StateTransitions::new()];
         let mut final_states: Vec<bool> = vec![false];
+        let mut seen: Vec<bool> = vec![false];
+        let stride = dfa.stride();
 
         let mut next_states = vec![start_state];
-
+        let trie = vocabulary.trie();
+        let st = std::time::Instant::now();
         while let Some(current_state) = next_states.pop() {
-            let current_idx = state_map[&current_state] as usize;
+            let current_idx = current_state.as_usize() / stride;
 
             if dfa.is_match_state(dfa.next_eoi_state(current_state)) {
+                final_states.resize(current_idx + 1, false);
                 final_states[current_idx] = true;
             }
 
-            'token_loop: for (token, ids) in vocabulary.tokens().iter() {
-                if ids.contains(&eos_token_id) {
-                    continue;
-                }
+            // Traverse the trie and DFA simultaneously to find valid tokens from this state.
+            {
+                let mut stack: Vec<(&TrieNode, AutomataStateId)> = Vec::new();
+                // start from trie root and current DFA state
+                stack.push((trie.node(trie.root_index()), current_state));
+                let mut ret = Vec::new();
 
-                let mut next_state = current_state;
-                for transition_byte in token {
-                    next_state = dfa.next_state(next_state, *transition_byte);
-                    if dfa.is_dead_state(next_state) || dfa.is_quit_state(next_state) {
-                        continue 'token_loop;
+                while let Some((node, dfa_state)) = stack.pop() {
+
+                    for (b, child_idx) in node.children() {
+                        let next_state = next_state(&dfa, dfa_state, b);
+                        if dfa.is_dead_state(next_state) || dfa.is_quit_state(next_state) {
+                            continue;
+                        }
+                        if !is_match_state(&dfa, next_state) || is_match_state(&dfa, dfa.next_eoi_state(next_state)) {
+                            if let Some(ids) = trie.node(child_idx).terminal_ids() {
+                                // make sure current_idx has a entry in state_map
+                                let target_idx = (next_state.as_usize() / stride);
+                                if target_idx >= transitions.len() {
+                                    transitions.resize(target_idx + 1, StateTransitions::new());
+                                    final_states.resize(target_idx + 1, false);
+                                    seen.resize(target_idx + 1, false);
+                                }
+                                if !seen[target_idx] {
+                                    seen[target_idx] = true;
+                                    next_states.push(next_state);
+                                }
+                                let target_idx_sid = target_idx as StateId;
+
+                                for id in ids {
+                                    ret.push((*id, target_idx_sid));
+                                }
+                            }
+                            stack.push((trie.node(child_idx), next_state));
+                        }
                     }
                 }
-
-                let is_intermediate_state = !dfa.is_match_state(next_state);
-                let is_full_match_state = dfa.is_match_state(dfa.next_eoi_state(next_state));
-                if is_intermediate_state || is_full_match_state {
-                    let next_idx = if let Some(&idx) = state_map.get(&next_state) {
-                        idx
-                    } else {
-                        let new = state_map.len() as StateId;
-                        state_map.insert(next_state, new);
-                        transitions.push(StateTransitions::new());
-                        final_states.push(false);
-                        next_states.push(next_state);
-                        new
-                    };
-
-                    for &token_id in ids {
-                        transitions[current_idx].insert(token_id, next_idx);
-                    }
+                for (token_id, state_id) in ret {
+                    transitions[current_idx].insert(token_id, state_id);
                 }
             }
         }
 
         for (state_idx, &is_final) in final_states.iter().enumerate() {
             if is_final {
+                if state_idx >= transitions.len() {
+                    transitions.resize(state_idx + 1, StateTransitions::new());
+                }
                 transitions[state_idx].insert(eos_token_id, state_idx as StateId);
             }
         }
 
         Ok(Self {
-            initial_state: 0,
+            initial_state: (start_state.as_usize() / stride) as StateId,
             final_states,
             transitions,
             eos_token_id,

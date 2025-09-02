@@ -51,19 +51,21 @@ mod processor;
 /// vocabulary.remove("token");
 /// assert_eq!(vocabulary.token_ids("token"), None);
 /// ```
+pub(crate) mod trie;
+use trie::{Ids, Trie};
+
 #[derive(Clone, Debug, Default, PartialEq, Encode, Decode)]
 pub struct Vocabulary {
     eos_token_id: TokenId,
-    tokens: HashMap<Token, Vec<TokenId>>,
+    trie: Trie,
+    // number of non-eos token ids stored (for len())
+    count_ids: usize,
 }
 
 impl Vocabulary {
     /// Creates an empty vocabulary.
     pub fn new(eos_token_id: TokenId) -> Self {
-        Self {
-            eos_token_id,
-            tokens: HashMap::default(),
-        }
+        Self { eos_token_id, trie: Trie::new(), count_ids: 0 }
     }
 
     /// Creates the vocabulary of pre-trained model from Hugging Face Hub.
@@ -117,14 +119,9 @@ impl Vocabulary {
         Ok(vocabulary)
     }
 
-    /// Returns all tokens with their token ids in vocabulary.
-    pub fn tokens(&self) -> &HashMap<Token, Vec<TokenId>> {
-        &self.tokens
-    }
-
     /// Returns all token ids per provided token if available in the vocabulary.
-    pub fn token_ids(&self, token: impl AsRef<[u8]>) -> Option<&Vec<TokenId>> {
-        self.tokens.get(token.as_ref())
+    pub fn token_ids(&self, token: impl AsRef<[u8]>) -> Option<&Ids> {
+        self.trie.get(token.as_ref())
     }
 
     /// Gets the identifier of the special end of the sentence token.
@@ -138,23 +135,26 @@ impl Vocabulary {
             return Err(Error::EOSTokenDisallowed);
         }
         let token = token.into();
-        self.tokens.entry(token).or_default().push(id);
+        let added = self.trie.insert(token, id);
+        if added { self.count_ids += 1; }
         Ok(())
     }
 
     /// Removes a given token from the vocabulary.
     pub fn remove(&mut self, token: impl Into<Token>) {
         let token = token.into();
-        self.tokens.remove(&token);
+        if let Some(removed) = self.trie.remove(&token) {
+            self.count_ids = self.count_ids.saturating_sub(removed);
+        }
     }
 
     pub fn len(&self) -> usize {
-        // +1 for eos_token_id which is not in self.tokens map.
-        self.tokens.values().map(|ids| ids.len()).sum::<usize>() + 1
+        // +1 for eos_token_id which is not stored in the trie.
+        self.count_ids + 1
     }
 
     pub fn is_empty(&self) -> bool {
-        self.tokens.is_empty()
+        self.count_ids == 0
     }
 
     /// Filters out `Prepend` kind of tokenizer's normalizers.
@@ -195,8 +195,9 @@ impl std::fmt::Display for Vocabulary {
             "Vocabulary object with eos_token_id={:?} and the following tokens to token_ids:",
             self.eos_token_id
         )?;
-        for (token, token_ids) in self.tokens.iter() {
-            writeln!(
+        // Iterate trie to display tokens
+        self.trie.for_each(|token, token_ids| {
+            let _ = writeln!(
                 f,
                 "{:?} -> {:?}",
                 token
@@ -204,8 +205,8 @@ impl std::fmt::Display for Vocabulary {
                     .map(|b| format!("0x{:02X}", b))
                     .collect::<Vec<_>>(),
                 token_ids
-            )?;
-        }
+            );
+        });
         Ok(())
     }
 }
@@ -218,10 +219,13 @@ impl TryFrom<(TokenId, HashMap<Token, Vec<TokenId>>)> for Vocabulary {
         if tokens.iter().any(|(_, ids)| ids.contains(&eos_token_id)) {
             return Err(Error::EOSTokenDisallowed);
         }
-        Ok(Vocabulary {
-            eos_token_id,
-            tokens,
-        })
+        let mut v = Vocabulary::new(eos_token_id);
+        for (t, ids) in tokens {
+            for id in ids {
+                v.try_insert(t.clone(), id)?;
+            }
+        }
+        Ok(v)
     }
 }
 
@@ -230,19 +234,22 @@ impl TryFrom<(TokenId, HashMap<String, Vec<TokenId>>)> for Vocabulary {
 
     fn try_from(values: (TokenId, HashMap<String, Vec<TokenId>>)) -> Result<Self, Self::Error> {
         let (eos_token_id, tokens) = values;
-        Ok(Vocabulary {
-            eos_token_id,
-            tokens: tokens
-                .into_iter()
-                .map(|(k, v)| {
-                    if v.contains(&eos_token_id) {
-                        Err(Error::EOSTokenDisallowed)
-                    } else {
-                        Ok((k.as_bytes().to_vec(), v))
-                    }
-                })
-                .collect::<Result<HashMap<Token, Vec<TokenId>>, _>>()?,
-        })
+        let mut v = Vocabulary::new(eos_token_id);
+        for (k, v_ids) in tokens {
+            if v_ids.contains(&eos_token_id) { return Err(Error::EOSTokenDisallowed); }
+            for id in v_ids { v.try_insert(k.as_bytes().to_vec(), id)?; }
+        }
+        Ok(v)
+    }
+}
+
+impl Vocabulary {
+    // Expose trie for internal consumers (Index) to traverse efficiently.
+    pub(crate) fn trie(&self) -> &Trie { &self.trie }
+
+    // Helper for Index to compute maximum token id.
+    pub(crate) fn max_token_id(&self) -> Option<TokenId> {
+        Some((self.count_ids + 1) as u32)
     }
 }
 
@@ -264,14 +271,13 @@ mod tests {
 
         // New empty vocabulary.
         assert_eq!(vocabulary.eos_token_id, eos_token_id);
-        assert!(vocabulary.tokens.is_empty());
+        assert!(vocabulary.is_empty());
 
         for (token, id) in [("zero", 0), ("one", 1), ("two", 2)] {
             vocabulary.try_insert(token, id).expect("Insert failed");
             assert_eq!(vocabulary.token_ids(token), Some(&vec![id]));
         }
-        assert_eq!(vocabulary.tokens.len(), 3);
-        assert_eq!(vocabulary.tokens().len(), 3);
+        assert_eq!(vocabulary.len(), 4); // 3 + eos
 
         // Confirm different types.
         vocabulary.try_insert(b"four", 4).expect("Insert failed");
@@ -302,7 +308,7 @@ mod tests {
         let map: HashMap<Token, Vec<TokenId>> = HashMap::default();
         let vocabulary = Vocabulary::try_from((1_u32, map)).expect("Vocabulary failed");
         assert_eq!(vocabulary.eos_token_id, 1);
-        assert!(vocabulary.tokens.is_empty());
+        assert!(vocabulary.is_empty());
     }
 
     #[test]
@@ -325,7 +331,7 @@ mod tests {
             match vocabulary {
                 Ok(v) => {
                     assert_eq!(v.eos_token_id, v.eos_token_id());
-                    assert!(!v.tokens.is_empty());
+                    assert!(!v.is_empty());
                 }
                 Err(_) => unreachable!(),
             }

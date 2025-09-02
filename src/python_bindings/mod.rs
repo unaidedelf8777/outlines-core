@@ -418,10 +418,10 @@ impl PyVocabulary {
     /// Gets token ids of a given token.
     fn get(&self, py: Python<'_>, token: Py<PyAny>) -> PyResult<Option<Vec<TokenId>>> {
         if let Ok(t) = token.extract::<String>(py) {
-            return Ok(self.0.token_ids(t.into_bytes()).cloned());
+            return Ok(self.0.token_ids(t.as_bytes()).map(|ids| ids.to_vec()));
         }
         if let Ok(t) = token.extract::<Token>(py) {
-            return Ok(self.0.token_ids(&t).cloned());
+            return Ok(self.0.token_ids(&t).map(|ids| ids.to_vec()));
         }
         Err(PyErr::new::<pyo3::exceptions::PyTypeError, _>(format!(
             "Expected a token of type str or bytes, got {:?}",

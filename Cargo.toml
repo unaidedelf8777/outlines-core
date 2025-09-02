@@ -18,6 +18,9 @@ serde = {version = "1.0", features = ["derive"]}
 bincode = "2.0.1"
 rustc-hash = "2.1.0"
 regex-automata = "0.4.9"
+smallvec = "1.15.1"
+anyhow = "1.0.99"
+pprof = { version = "0.15.0", features = ["flamegraph"] }
 
 # Below are fragile dependencies, even minor updates of which often break the code
 [dependencies.hf-hub]
@@ -42,6 +45,8 @@ lto = true
 codegen-units = 1
 strip = true
 panic = 'abort'
+debug = true
+
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tarpaulin_include)'] }
@@ -50,3 +55,7 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tarpaulin_include)'] }
 name = "convert-json-schema"
 test = false
 bench = false
+
+[[bin]]
+name = "oc-index-prof"
+path = "src/bin/oc_index_prof.rs"
