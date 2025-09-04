@@ -51,7 +51,7 @@ impl PyGuide {
             std::ptr::write_bytes(dst.as_mut_ptr() as *mut u8, 0, len * 4);
         }
         if let Some(tokens) = index.0.allowed_tokens_iter(&state) {
-            for &token in tokens {
+            for token in tokens {
                 let t = token as usize;
                 let bucket = t / 32;
                 if bucket < len {
@@ -180,7 +180,7 @@ impl PyGuide {
         }
         if let Some(tokens) = self.index.0.allowed_tokens_iter(&self.state) {
             let slice = unsafe { std::slice::from_raw_parts_mut(data_ptr as *mut u32, numel) };
-            for &token in tokens {
+            for token in tokens {
                 let bucket = (token as usize) / 32;
                 if bucket < slice.len() {
                     slice[bucket] |= 1 << ((token as usize) % 32);
@@ -277,12 +277,11 @@ impl PyIndex {
     fn get_transitions(&self) -> HashMap<StateId, HashMap<TokenId, StateId>> {
         let mut map = HashMap::default();
         for (state_id, row) in self.0.transitions().iter().enumerate() {
-            if !row.tokens.is_empty() {
+            if !row.is_empty() {
                 let inner = row
-                    .tokens
-                    .iter()
-                    .zip(row.next_states.iter())
-                    .map(|(&t, &s)| (t, s))
+                    .tokens()
+                    .zip(row.states())
+                    .map(|(t, s)| (t, s))
                     .collect();
                 map.insert(state_id as StateId, inner);
             }

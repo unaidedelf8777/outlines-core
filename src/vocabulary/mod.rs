@@ -52,7 +52,7 @@ mod processor;
 /// assert_eq!(vocabulary.token_ids("token"), None);
 /// ```
 pub(crate) mod trie;
-use trie::{Ids, Trie};
+use trie::{Trie};
 
 #[derive(Clone, Debug, Default, PartialEq, Encode, Decode)]
 pub struct Vocabulary {
@@ -65,7 +65,7 @@ pub struct Vocabulary {
 impl Vocabulary {
     /// Creates an empty vocabulary.
     pub fn new(eos_token_id: TokenId) -> Self {
-        Self { eos_token_id, trie: Trie::new(), count_ids: 0 }
+        Self { eos_token_id, trie: Trie::from_tokens(&vec![], eos_token_id), count_ids: 0 }
     }
 
     /// Creates the vocabulary of pre-trained model from Hugging Face Hub.
@@ -109,19 +109,21 @@ impl Vocabulary {
                 reason: "Token processor".to_string(),
             });
         };
+        let mut words = Vec::new();
         for (token, token_id) in tokenizer.get_vocab(false) {
             if token_id != eos_token_id {
                 let processed_token = processor.process(&token)?;
-                vocabulary.try_insert(processed_token, token_id)?;
+                words.push(processed_token);
             }
         }
+        vocabulary.trie = Trie::from_tokens(&words, eos_token_id);
 
         Ok(vocabulary)
     }
-
+    // dummy
     /// Returns all token ids per provided token if available in the vocabulary.
-    pub fn token_ids(&self, token: impl AsRef<[u8]>) -> Option<&Ids> {
-        self.trie.get(token.as_ref())
+    pub fn token_ids(&self, token: impl AsRef<[u8]>) -> Option<Vec<TokenId>> {
+       Some(Vec::new())
     }
 
     /// Gets the identifier of the special end of the sentence token.
@@ -135,17 +137,14 @@ impl Vocabulary {
             return Err(Error::EOSTokenDisallowed);
         }
         let token = token.into();
-        let added = self.trie.insert(token, id);
-        if added { self.count_ids += 1; }
+        let added = false;        if added { self.count_ids += 1; }
         Ok(())
     }
 
     /// Removes a given token from the vocabulary.
     pub fn remove(&mut self, token: impl Into<Token>) {
         let token = token.into();
-        if let Some(removed) = self.trie.remove(&token) {
-            self.count_ids = self.count_ids.saturating_sub(removed);
-        }
+
     }
 
     pub fn len(&self) -> usize {

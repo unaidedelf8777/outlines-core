@@ -14,90 +14,179 @@ use crate::{Error, Result};
 
 const EMPTY: u32 = u32::MAX;
 
+
 #[derive(Clone, Debug, PartialEq, Encode, Decode)]
 pub(crate) struct StateTransitions {
-    pub(crate) index: Vec<u32>,
-    pub(crate) tokens: Vec<TokenId>,
-    pub(crate) next_states: Vec<StateId>,
+    pub(crate) index: Vec<u32>, // open-address table: slot -> pairs index
+    pub(crate) pairs: Vec<u64>, // packed (token | state<<32)
 }
 
 impl StateTransitions {
-    fn new() -> Self {
+    // Tunable load factor: 90%
+    const LOAD_NUM: usize = 9;
+    const LOAD_DEN: usize = 10;
+
+    pub fn new() -> Self {
         Self {
             index: Vec::new(),
-            tokens: Vec::new(),
-            next_states: Vec::new(),
+            pairs: Vec::new(),
         }
     }
 
-    fn insert(&mut self, token: TokenId, state: StateId) {
-        if self.tokens.len() * 2 + 1 > self.index.len() {
+    pub fn is_empty(&self) -> bool {
+        self.index.is_empty() && self.pairs.is_empty()
+    }
+
+    #[inline(always)]
+    fn pack(token: TokenId, state: StateId) -> u64 { ((state as u64) << 32) | (token as u64) }
+
+    #[inline(always)]
+    fn hash(token: u32) -> u32 {
+        token.wrapping_mul(0x9E37_79B1)
+    }
+
+    #[inline(always)]
+    fn unpack_state(pair: u64) -> StateId { (pair >> 32) as u32 }
+
+    #[inline(always)]
+    fn unpack_token(pair: u64) -> TokenId { pair as u32 }
+
+    #[inline]
+    fn need_grow(&self) -> bool {
+        if self.index.is_empty() {
+            return true;
+        }
+        // Will we exceed 90% *after* inserting one more?
+        (self.pairs.len() + 1) * Self::LOAD_DEN > self.index.len() * Self::LOAD_NUM
+    }
+
+    /// Build from duplicate-free pairs, sizing so that adding *one* more entry
+    /// (EOS) still stays at or below a 90% load factor.
+    pub fn bulk_build(pairs_in: &[(TokenId, StateId)]) -> Self {
+        let entries = pairs_in.len();
+
+        // We guarantee room for one more entry without resize:
+        // choose index_len s.t. ceil((entries + 1) / 0.9) is a power of two.
+        let target_entries = entries + 1; // account for future EOS insert
+        let mut need = (target_entries * Self::LOAD_DEN + (Self::LOAD_NUM - 1)) / Self::LOAD_NUM; // ceil
+        need = need.max(2); // at least 2
+
+        let index_len = need.next_power_of_two();
+        let mut index = vec![EMPTY; index_len];
+        let mut pairs = Vec::with_capacity(target_entries); // exact room for EOS later
+
+        if entries == 0 {
+            return Self { index, pairs };
+        }
+
+        let mask = (index_len - 1) as u32;
+
+        // Fill once; input has no duplicates.
+        for &(token, state) in pairs_in {
+            let mut pos = (Self::hash(token) & mask) as usize;
+            while index[pos] != EMPTY {
+                pos = (pos + 1) & (mask as usize);
+            }
+            let idx = pairs.len() as u32;
+            index[pos] = idx;
+            pairs.push(Self::pack(token, state));
+        }
+
+        Self { index, pairs }
+    }
+
+    pub fn insert(&mut self, token: TokenId, state: StateId) {
+        // With 90% LF, this won't trigger when bulk_build sized correctly for one extra.
+        if self.index.is_empty() || self.need_grow() {
             self.resize();
         }
-        let mask = self.index.len() - 1;
-        let mut pos = (token as usize) & mask;
+        let mask = (self.index.len() - 1) as u32;
+        let mut pos = (Self::hash(token) & mask) as usize;
+
         loop {
             let slot = self.index[pos];
             if slot == EMPTY {
-                self.index[pos] = self.tokens.len() as u32;
-                self.tokens.push(token);
-                self.next_states.push(state);
-                break;
-            } else if self.tokens[slot as usize] == token {
-                self.next_states[slot as usize] = state;
-                break;
-            } else {
-                pos = (pos + 1) & mask;
+                let idx = self.pairs.len() as u32;
+                self.index[pos] = idx;
+                self.pairs.push(Self::pack(token, state));
+                return;
             }
+            let i = slot as usize;
+            let pair = self.pairs[i];
+            if Self::unpack_token(pair) == token {
+                self.pairs[i] = Self::pack(token, state);
+                return;
+            }
+            pos = (pos + 1) & (mask as usize);
         }
     }
 
     fn resize(&mut self) {
         let new_len = (self.index.len().max(1) * 2).next_power_of_two();
         let mut new_index = vec![EMPTY; new_len];
-        let mask = new_len - 1;
-        for i in 0..self.tokens.len() {
-            let token = self.tokens[i];
-            let mut pos = (token as usize) & mask;
+        let mask = (new_len - 1) as u32;
+
+        for (i, &pair) in self.pairs.iter().enumerate() {
+            let token = Self::unpack_token(pair);
+            let mut pos = (Self::hash(token) & mask) as usize;
             while new_index[pos] != EMPTY {
-                pos = (pos + 1) & mask;
+                pos = (pos + 1) & (mask as usize);
             }
             new_index[pos] = i as u32;
         }
         self.index = new_index;
     }
 
-    fn get(&self, token: TokenId) -> Option<StateId> {
-        if self.index.is_empty() {
-            return None;
-        }
-        let mask = self.index.len() - 1;
-        let mut pos = (token as usize) & mask;
+    #[inline(always)]
+    pub fn get(&self, token: TokenId) -> Option<StateId> {
+        let len = self.index.len();
+        if len == 0 { return None; }
+        let mask = (len - 1) as u32;
+        let mut pos = (Self::hash(token) & mask) as usize;
+
         loop {
             let slot = self.index[pos];
-            if slot == EMPTY {
-                return None;
+            if slot == EMPTY { return None; }
+            let pair = self.pairs[slot as usize];
+            if Self::unpack_token(pair) == token {
+                return Some(Self::unpack_state(pair));
             }
-            if self.tokens[slot as usize] == token {
-                return Some(self.next_states[slot as usize]);
-            }
-            pos = (pos + 1) & mask;
+            pos = (pos + 1) & (mask as usize);
         }
     }
 
-    fn tokens(&self) -> &[TokenId] {
-        &self.tokens
+    /// O(1) to create, zero-alloc iterator over all TokenIds.
+    pub fn tokens(&self) -> Tokens<'_> {
+        Tokens { it: self.pairs.iter() }
+    }
+
+    pub fn states(&self) -> States<'_> {
+        States { it: self.pairs.iter() }
     }
 }
 
-#[inline(never)]
-pub fn is_match_state<T>(dfa: &DFA<T>, state: AutomataStateId) -> bool  where T: AsRef<[u32]> {
-    dfa.is_match_state(state) && !dfa.is_match_state(dfa.next_eoi_state(state))
+/// Zero-alloc iterator over tokens (views low 32 bits of each pair).
+pub struct Tokens<'a> {
+    it: std::slice::Iter<'a, u64>,
+}
+impl<'a> Iterator for Tokens<'a> {
+    type Item = TokenId;
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        self.it.next().map(|&p| p as u32)
+    }
 }
 
-#[inline(never)]
-pub fn next_state<T>(dfa: &DFA<T>, state: AutomataStateId, b: u8) -> AutomataStateId where T: AsRef<[u32]> {
-    dfa.next_state(state, b)
+/// Zero-alloc iterator over states (high 32 bits of each pair).
+pub struct States<'a> {
+    it: std::slice::Iter<'a, u64>,
+}
+impl<'a> Iterator for States<'a> {
+    type Item = StateId;
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        self.it.next().map(|&p| (p >> 32) as u32)
+    }
 }
 
 /// `Index` efficiently maps vocabulary tokens to state transitions.
@@ -175,8 +264,9 @@ impl Index {
         let stride = dfa.stride();
 
         let mut next_states = vec![start_state];
+        // buffer so we can bulk build transitions
+        let mut ret = Vec::new();
         let trie = vocabulary.trie();
-        let st = std::time::Instant::now();
         while let Some(current_state) = next_states.pop() {
             let current_idx = current_state.as_usize() / stride;
 
@@ -189,18 +279,17 @@ impl Index {
             {
                 let mut stack: Vec<(&TrieNode, AutomataStateId)> = Vec::new();
                 // start from trie root and current DFA state
-                stack.push((trie.node(trie.root_index()), current_state));
-                let mut ret = Vec::new();
+                stack.push((trie.root(), current_state));
 
                 while let Some((node, dfa_state)) = stack.pop() {
 
-                    for (b, child_idx) in node.children() {
-                        let next_state = next_state(&dfa, dfa_state, b);
+                    for n in trie.children(node) {
+                        let next_state = dfa.next_state(dfa_state, n.byte());
                         if dfa.is_dead_state(next_state) || dfa.is_quit_state(next_state) {
                             continue;
                         }
-                        if !is_match_state(&dfa, next_state) || is_match_state(&dfa, dfa.next_eoi_state(next_state)) {
-                            if let Some(ids) = trie.node(child_idx).terminal_ids() {
+                        if !dfa.is_match_state(next_state) || dfa.is_match_state(dfa.next_eoi_state(next_state)) {
+                            if let Some(id) = n.token_id() {
                                 // make sure current_idx has a entry in state_map
                                 let target_idx = (next_state.as_usize() / stride);
                                 if target_idx >= transitions.len() {
@@ -212,18 +301,15 @@ impl Index {
                                     seen[target_idx] = true;
                                     next_states.push(next_state);
                                 }
-                                let target_idx_sid = target_idx as StateId;
-
-                                for id in ids {
-                                    ret.push((*id, target_idx_sid));
-                                }
+                                ret.push((id, target_idx as StateId));
                             }
-                            stack.push((trie.node(child_idx), next_state));
+                            stack.push((n, next_state));
                         }
                     }
                 }
-                for (token_id, state_id) in ret {
-                    transitions[current_idx].insert(token_id, state_id);
+                if !ret.is_empty() {
+                    transitions[current_idx] = StateTransitions::bulk_build(&ret);
+                    ret.clear();
                 }
             }
         }
@@ -273,14 +359,18 @@ impl Index {
     }
 
     /// Lists allowed tokens for a given state ID or `None` if it is not found in `Index`.
-    pub fn allowed_tokens(&self, state: &StateId) -> Option<&[TokenId]> {
-        self.transitions.get(*state as usize).map(|t| t.tokens())
+    pub fn allowed_tokens(&self, state: &StateId) -> Option<Vec<TokenId>> {
+        let t = self.transitions.get(*state as usize);
+        match t {
+            Some(t) => Some(t.tokens().collect::<Vec<u32>>()),
+            None => None,
+        }
     }
 
-    pub fn allowed_tokens_iter(&self, state: &StateId) -> Option<impl Iterator<Item = &TokenId>> {
+    pub fn allowed_tokens_iter(&self, state: &StateId) -> Option<impl Iterator<Item = TokenId> + use<'_>> {
         self.transitions
             .get(*state as usize)
-            .map(|t| t.tokens.iter())
+            .map(|t| t.tokens())
     }
 
     /// Returns transition state for a given state and token id or `None` otherwise.
@@ -304,10 +394,9 @@ impl std::fmt::Display for Index {
         writeln!(f, "Index object with transitions:")?;
         for (state_id, row) in self.transitions.iter().enumerate() {
             let pairs: Vec<_> = row
-                .tokens
-                .iter()
-                .zip(row.next_states.iter())
-                .map(|(t, s)| (*t, *s))
+                .tokens()
+                .zip(row.states())
+                .map(|(t, s)| (t, s))
                 .collect();
             if !pairs.is_empty() {
                 writeln!(f, "{} -> {:?}", state_id, pairs)?;
