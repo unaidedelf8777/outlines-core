@@ -74,9 +74,7 @@ impl Trie {
     fn node_offset(&self, n: &TrieNode) -> usize {
         let base = self.root() as *const TrieNode as usize;
         let ptr  = n as *const TrieNode as usize;
-        debug_assert!(ptr >= base);
         let off = (ptr - base) / std::mem::size_of::<TrieNode>();
-        debug_assert!(off < self.nodes.len());
         off
     }
 
@@ -92,6 +90,14 @@ impl Trie {
             trie: self,
             current_offset: off + 1,
             end_offset: off + n.subtree_size(),
+        }
+    }
+
+    pub fn children_from_to<'a>(&'a self, start: usize, end: usize) -> NodeChildren<'a> {
+        NodeChildren {
+            trie: self,
+            current_offset: start,
+            end_offset: end,
         }
     }
 
@@ -355,5 +361,112 @@ impl HashTrie {
         // Patch subtree size (nodes written under this node, including itself)
         let subtree = (out.len() - here) as u32;
         out[here].bits2 |= subtree << 8;
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ClassGroups {
+    // For node at offset i:
+    // - groups for node are at bounds[2*idx .. 2*(idx+cnt)]
+    group_idx: Vec<u32>,     // len == trie.nodes.len()
+    group_cnt: Vec<u16>,     // len == trie.nodes.len()
+    bounds:    Vec<u32>,     // packed [start_off, end_off) pairs
+    group_class: Vec<u8>,    // class id per group, same order as bounds pairs
+}
+
+impl ClassGroups {
+    pub fn build(trie: &Trie, byte_to_class: &[u8; 256]) -> Self {
+        let n_nodes = trie.nodes.len();
+        let mut group_idx = vec![0u32; n_nodes];
+        let mut group_cnt = vec![0u16; n_nodes];
+        let mut bounds: Vec<u32> = Vec::new();
+        let mut group_class: Vec<u8> = Vec::new();
+
+        // Walk all nodes; children segment is [off+1, off+subtree)
+        for node_off in 0..n_nodes {
+            let node = &trie.nodes[node_off];
+            let start = node_off + 1;
+            let end   = node_off + node.subtree_size();
+
+            if start >= end {
+                // leaf
+                group_idx[node_off] = (bounds.len() / 2) as u32;
+                group_cnt[node_off] = 0;
+                continue;
+            }
+
+            let mut cur = start;
+            let idx0 = (bounds.len() / 2) as u32; // start index for this node
+
+            // children are byte-sorted; classes are contiguous ranges
+            while cur < end {
+                let first = &trie.nodes[cur];
+                let cls = byte_to_class[first.byte() as usize];
+                let mut p = cur;
+                // advance until class changes
+                while p < end {
+                    let n = &trie.nodes[p];
+                    let n_cls = byte_to_class[n.byte() as usize];
+                    if n_cls != cls { break; }
+                    p += n.subtree_size();
+                }
+                // record one group
+                bounds.push(cur as u32);
+                bounds.push(p as u32);
+                group_class.push(cls);
+
+                cur = p;
+            }
+
+            let cnt = ((bounds.len() / 2) as u32 - idx0) as u16;
+            group_idx[node_off] = idx0;
+            group_cnt[node_off] = cnt;
+        }
+
+        Self { group_idx, group_cnt, bounds, group_class }
+    }
+
+    #[inline]
+    pub fn groups<'a>(&'a self, trie: &'a Trie, node: &'a TrieNode)
+        -> ClassGroupIter<'a>
+    {
+        let off = trie.node_offset(node);
+        let idx = self.group_idx[off] as usize;
+        let cnt = self.group_cnt[off] as usize;
+        ClassGroupIter {
+            trie,
+            bounds: &self.bounds[2*idx .. 2*(idx+cnt)],
+            classes: &self.group_class[idx .. idx+cnt],
+            i: 0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct ClassChildGroup<'a> {
+    pub rep: &'a TrieNode,     // first child in the group
+    pub class: u8,             // byte class id
+    pub start_off: usize,      // node offset of first child
+    pub end_off: usize,        // exclusive
+}
+
+pub struct ClassGroupIter<'a> {
+    trie: &'a Trie,
+    bounds: &'a [u32],     // len is 2*count
+    classes: &'a [u8],     // len is count
+    i: usize,
+}
+
+impl<'a> Iterator for ClassGroupIter<'a> {
+    type Item = ClassChildGroup<'a>;
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.i >= self.classes.len() { return None; }
+        let b0 = self.bounds[2*self.i] as usize;
+        let b1 = self.bounds[2*self.i + 1] as usize;
+        let cls = self.classes[self.i];
+        let rep = &self.trie.nodes[b0];
+        self.i += 1;
+        Some(ClassChildGroup { rep, class: cls, start_off: b0, end_off: b1 })
     }
 }

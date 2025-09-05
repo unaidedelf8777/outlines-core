@@ -17,7 +17,7 @@ serde_json = { version = "1.0", features = ["preserve_order"] }
 serde = {version = "1.0", features = ["derive"]}
 bincode = "2.0.1"
 rustc-hash = "2.1.0"
-regex-automata = "0.4.9"
+regex-automata = {git = "https://github.com/unaidedelf8777/regex-automata.git", branch = "main", features = ["perf-inline"] }
 smallvec = "1.15.1"
 anyhow = "1.0.99"
 pprof = { version = "0.15.0", features = ["flamegraph"] }

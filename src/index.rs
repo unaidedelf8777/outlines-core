@@ -3,17 +3,16 @@
 use bincode::{Decode, Encode};
 use regex_automata::dfa::dense::DFA;
 use regex_automata::dfa::Automaton;
-use regex_automata::util::primitives::StateID as AutomataStateId;
+use regex_automata::util::{primitives::StateID as AutomataStateId, alphabet::ByteClasses};
 use regex_automata::Anchored;
 use rustc_hash::FxHashMap as HashMap;
 
 use crate::prelude::*;
 use crate::vocabulary::Vocabulary;
-use crate::vocabulary::trie::TrieNode;
+use crate::vocabulary::trie::{TrieNode, ClassGroups};
 use crate::{Error, Result};
 
 const EMPTY: u32 = u32::MAX;
-
 
 #[derive(Clone, Debug, PartialEq, Encode, Decode)]
 pub(crate) struct StateTransitions {
@@ -189,6 +188,15 @@ impl<'a> Iterator for States<'a> {
     }
 }
 
+fn byte_to_class(c: &ByteClasses) -> [u8; 256] {
+    let classes = c;
+    let mut byte_to_class: [u8; 256] = [0; 256];
+    for b in 0u8..=255 {
+        byte_to_class[b as usize] = classes.get(b);
+    }
+    byte_to_class
+}
+
 /// `Index` efficiently maps vocabulary tokens to state transitions.
 #[derive(Clone, Debug, PartialEq, Encode, Decode)]
 pub struct Index {
@@ -258,10 +266,11 @@ impl Index {
             None => return Err(Error::DfaHasNoStartState),
         };
 
-        let mut transitions: Vec<StateTransitions> = vec![StateTransitions::new()];
-        let mut final_states: Vec<bool> = vec![false];
-        let mut seen: Vec<bool> = vec![false];
+        let mut transitions: Vec<StateTransitions> = vec![StateTransitions::new(); dfa.state_len()];
+        let mut final_states: Vec<bool> = vec![false; dfa.state_len()];
+        let mut seen: Vec<bool> = vec![false; dfa.state_len()];
         let stride = dfa.stride();
+        let groups = ClassGroups::build(&vocabulary.trie(), &byte_to_class(&dfa.byte_classes()));
 
         let mut next_states = vec![start_state];
         // buffer so we can bulk build transitions
@@ -283,27 +292,34 @@ impl Index {
 
                 while let Some((node, dfa_state)) = stack.pop() {
 
-                    for n in trie.children(node) {
-                        let next_state = dfa.next_state(dfa_state, n.byte());
-                        if dfa.is_dead_state(next_state) || dfa.is_quit_state(next_state) {
+                    for g in groups.groups(&trie, node) {
+                        let next_state = dfa.next_state(dfa_state, g.rep.byte());
+
+                        if dfa.is_dead_state(next_state) {
+                            continue;
+                        } else if dfa.is_quit_state(next_state) {
                             continue;
                         }
-                        if !dfa.is_match_state(next_state) || dfa.is_match_state(dfa.next_eoi_state(next_state)) {
-                            if let Some(id) = n.token_id() {
-                                // make sure current_idx has a entry in state_map
-                                let target_idx = (next_state.as_usize() / stride);
-                                if target_idx >= transitions.len() {
-                                    transitions.resize(target_idx + 1, StateTransitions::new());
-                                    final_states.resize(target_idx + 1, false);
-                                    seen.resize(target_idx + 1, false);
+                        // doing the gate this way saves us a large number of unnesescarry calls.
+                        let proceed = if !dfa.is_match_state(next_state) {
+                            true
+                        } else {
+                            dfa.is_match_state(dfa.next_eoi_state(next_state))
+                        };
+                        
+                        if proceed {
+                            let target_idx = (next_state.as_usize() / stride);
+                            let target_idx_sid = target_idx as StateId;
+                            for n in trie.children_from_to(g.start_off, g.end_off) {
+                                if let Some(id) = n.token_id() {
+                                    ret.push((id, target_idx_sid))
                                 }
-                                if !seen[target_idx] {
-                                    seen[target_idx] = true;
-                                    next_states.push(next_state);
-                                }
-                                ret.push((id, target_idx as StateId));
+                                stack.push((n, next_state));
                             }
-                            stack.push((n, next_state));
+                            if !seen[target_idx] {
+                                seen[target_idx] = true;
+                                next_states.push(next_state);
+                            }
                         }
                     }
                 }
